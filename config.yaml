@@ -1,0 +1,46 @@
+# ------------------------------------------------------------------
+# PREDICTIVE MAINTENANCE CONFIGURATION
+# ------------------------------------------------------------------
+
+data:
+  train_file: 'CMaps/test_FD001.txt'
+
+features:
+  window_size: 10
+  correlation_threshold: 0.05
+  whitelist:
+    - "s_2"
+    - "s_14"
+    - "s_7"
+
+  sensor_names:
+    - "s_1"
+    - "s_2"
+    - "s_3"
+    - "s_4"
+    - "s_5"
+    - "s_6"
+    - "s_7"
+    - "s_8"
+    - "s_9"
+    - "s_10"
+    - "s_11"
+    - "s_12"
+    - "s_13"
+    - "s_14"
+    - "s_15"
+    - "s_16"
+    - "s_17"
+    - "s_18"
+    - "s_19"
+    - "s_20"
+    - "s_21"
+
+training:
+  test_size: 0.2
+  random_state: 42
+  n_estimators: 100
+
+output:
+  model_filename: "pdm_model_v1.pkl"
+  results_filename: "training_metrics.txt"
