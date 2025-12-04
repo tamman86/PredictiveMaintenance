@@ -1,20 +1,29 @@
 import pandas as pd
 import numpy as np
+import yaml
+import joblib
 import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import IsolationForest
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
+
+### Loading yaml configuration ###
+with open('config.yaml', 'r') as file:
+    config = yaml.safe_load(file)
+
+print(f"Target Dataset: {config['data']['train_file']}")
+print(f"Whitelisted Sensors: {config['features']['whitelist']}")
 
 ### Load and Prep Data
 # Define columns
 index_names = ['unit_nr', 'time_cycles']
 setting_names = ['setting_1', 'setting_2', 'setting_3']
-sensor_names = ['s_{}'.format(i) for i in range(1,22)]
+sensor_names = config['features']['sensor_names']
 col_names = index_names + setting_names + sensor_names
 
 # Load Data
-df = pd.read_csv('CMaps/test_FD001.txt', sep='\s+', header=None, names=col_names)
+df = pd.read_csv(config['data']['train_file'], sep='\s+', header=None, names=col_names)
 
 # Calculate Remaining Useful Life (RUL)
 # RUL = (Max Cycle the engine reached) - (Current Cycle)
@@ -28,15 +37,11 @@ df = df.merge(max_cycles, on=['unit_nr'], how='left')
 df['RUL'] = df['max'] - df['time_cycles']
 
 # Drop 'max' since its cheating with the answer
-df.drop('max', axis=1, inplace=True)
+#df.drop('max', axis=1, inplace=True)
 
 print(f"Data Loaded. Shape: {df.shape}")
-print(df[['unit_nr', 'time_cycles', 's_2', 's_14', 'RUL']].head())
 
 ### Feature Selection to remove irrelevant sensors ###
-
-# Create a whitelist to protect certain sensors regardless of Feature Selection
-do_not_remove_list = ['s_2', 's_14']
 
 # Filter #1: Remove "Constant" sensors (Variance = 0)
 def get_constant_sensors(df, sensors_list):
@@ -46,31 +51,63 @@ def get_constant_sensors(df, sensors_list):
             constant_sensors.append(sensor)
     return constant_sensors
 
-all_sensors = ['s_{}'.format(i) for i in range(1,22)]
-bad_sensors = get_constant_sensors(df, all_sensors)
-print(f"Dropping Constant Sensors: {bad_sensors}")
+bad_sensors = get_constant_sensors(df, sensor_names)
 
 # Filter #2: Remove "Low Correlation" sensors
-correlation_threshold = 0.05
+correlation_threshold = config['features']['correlation_threshold']
 
-correlations = df[all_sensors + ['RUL']].corr()['RUL']
+correlations = df[sensor_names + ['RUL']].corr()['RUL']
 low_corr_sensors = correlations[abs(correlations) < correlation_threshold].index.tolist()
-print(f"Dropping Low Correlation Sensors: {low_corr_sensors}")
 
 # Apply whitelist to sensor removal list
-bad_sensors = [s for s in bad_sensors if s not in do_not_remove_list]
-low_corr_sensors = [s for s in all_sensors if s not in do_not_remove_list]
+whitelist = config['features']['whitelist']
+bad_sensors = [s for s in bad_sensors if s not in whitelist]
+low_corr_sensors = [s for s in low_corr_sensors if s not in whitelist]
 
 # Finalize list of remaining sensors
-sensors_to_use = [s for s in all_sensors if s not in bad_sensors and s not in low_corr_sensors]
+sensors_to_use = [s for s in sensor_names if s not in bad_sensors and s not in low_corr_sensors]
 
 print(f"\nFinal Selected Sensors: ({len(sensors_to_use)}):")
 print(sensors_to_use)
 
+############### Anomaly Detection Logic ###############
+features = sensors_to_use
+healthy_percentage = config['anomaly_detection']['healthy_percentage']
 
+# Incorporating Dynamic Healthy Split
+df['cutoff_cycle'] = df['max'] * healthy_percentage
+
+train_data = df[df['time_cycles'] <= df['cutoff_cycle']]
+
+X_train_healthy = train_data[features]
+print(f"Training on {len(X_train_healthy)} rows.")
+print(f"Defined as first {healthy_percentage*100}% of each engine's life.")
+
+# Train Isolation Forest
+iso_forest = IsolationForest(n_estimators = 100, contamination = config['anomaly_detection']['contamination'], random_state = 42)
+iso_forest.fit(X_train_healthy)
+
+### Isolation Forest Test
+unit_no = 4
+unit_1 = df[df['unit_nr'] == unit_no].copy()
+unit_1_features = unit_1[features]
+
+anomaly_score = -1 * iso_forest.decision_function(unit_1_features)
+unit_1['smoothed_score'] = pd.Series(anomaly_score, index=unit_1.index).rolling(window=10).mean()
+
+plt.figure(figsize=(12, 6))
+plt.plot(unit_1['time_cycles'], anomaly_score, label='Raw Score', color='purple', alpha=0.3)
+plt.plot(unit_1['time_cycles'], unit_1['smoothed_score'], label='Smoothed Trend', color='purple', linewidth=2)
+plt.axhline(0, color='red', linestyle='--', label='Threshold')
+plt.title("Effect of Smoothing on False Positives")
+plt.legend()
+plt.show()
+
+
+############### Remaining Useful Life Logic ###############
 ### Implement Rolling Windows ###
 # Define window size
-window_size = 10
+window_size = config['features']['window_size']
 
 # Create rolling mean
 df_rolling = df.groupby('unit_nr')[sensors_to_use].rolling(window=window_size).mean()
@@ -82,23 +119,23 @@ df_std = df.groupby('unit_nr')[sensors_to_use].rolling(window=window_size).std()
 df_std.columns = [f"{col}_std" for col in sensors_to_use]
 df_std = df_std.reset_index(level=0, drop=True)
 
-df_processed = pd.concat([df, df_rolling, df_std], axis = 1)
-
-df_processed = df_processed.dropna()
+df_processed = pd.concat([df, df_rolling, df_std], axis = 1).dropna()
 
 print(f"New Data Shape: {df_processed.shape}")
-print("Added columns like: s_2_mean and s_2_std")
 
 ### Training the model ###
-features = sensors_to_use + list(df_rolling.columns) + list(df_std.columns)
-X = df_processed[features]
+features_final = sensors_to_use + list(df_rolling.columns) + list(df_std.columns)
+X = df_processed[features_final]
 y = df_processed['RUL']
 
 # Training and Testing
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.2, random_state =42)
+X_train, X_test, y_train, y_test = train_test_split(X, y,
+                                                    test_size = config['training']['test_size'],
+                                                    random_state = config['training']['random_state'])
 
 # Train model
-model = RandomForestRegressor(n_estimators=100, random_state=42)
+model = RandomForestRegressor(n_estimators = config['training']['n_estimators'],
+                              random_state = config['training']['random_state'])
 model.fit(X_train, y_train)
 
 # Evaluate
@@ -106,10 +143,25 @@ predictions = model.predict(X_test)
 rmse = np.sqrt(mean_squared_error(y_test, predictions))
 print(f"Model RMSE: {rmse:.2f} cycles")   # On average, the prediciton is off by +/- {rmse} cycles
 
+
+### Save Products ###
+model_package = {
+    'model': model,
+    'features': features_final,
+    'sensor_list': sensors_to_use,
+    'rmse': rmse,
+    'config': config
+}
+
+output_file = config['output']['model_filename']
+joblib.dump(model_package, output_file)
+print(f"Model saved to {output_file}")
+
+'''
 ### Volatility Threshold Tuning ###
 # Setup healthy time vs failing time
-healthy_data = df_processed[df_processed['RUL'] > 100]
-failing_data = df_processed[df_processed['RUL'] <= 30]
+healthy_data = df_processed[df_processed['RUL'] > config['parameters']['healthy_threshold']]
+failing_data = df_processed[df_processed['RUL'] <= config['parameters']['warning_threshold']]
 
 # Volatility analysis for selected sensor on healthy engines
 mean_vol = healthy_data['s_7_std'].mean()
@@ -123,7 +175,8 @@ sigma_3 = mean_vol + (3 * std_vol)  # 99.7% Confidence for Critical
 
 ### Alerting Logic ###
 # Take live sensor data, predict RUL, and issue alert if critical
-def generate_alert(df_row_data, features_list, threshold_rul=30, threshold_volatility=sigma_2):
+def generate_alert(df_row_data, features_list, threshold_rul=config['parameters']['warning_threshold'],
+                   threshold_volatility=sigma_2):
     input_data = df_row_data[features_list].to_frame().T # Reshape input to one row dataframe
 
     pred_rul = model.predict(input_data)[0]
@@ -134,7 +187,7 @@ def generate_alert(df_row_data, features_list, threshold_rul=30, threshold_volat
     status = "GREEN"
     message = "System Normal"
 
-    if pred_rul < 15:
+    if pred_rul < config['parameters']['critical_threshold']:
         status = "RED"
         message = f"CRITICAL FAILURE IMMINENT. Predicted RUL: {round(pred_rul, 1)} cycles."
     elif pred_rul < threshold_rul:
@@ -165,7 +218,8 @@ data_stable_failing = df_processed[(df_processed['unit_nr']==7) & (df_processed[
 high_vol_row = df_processed.loc[df_processed['s_7_std'].idxmax()]
 
 print("\n--- Case #1: Stable but Failing ---")
-print(generate_alert(data_stable_failing, features))
+print(generate_alert(data_stable_failing, features_final))
 
 print("\n--- Case #2: High Volatility Event ---")
-print(generate_alert(high_vol_row, features))
+print(generate_alert(high_vol_row, features_final))
+'''

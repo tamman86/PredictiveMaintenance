@@ -5,6 +5,16 @@
 data:
   train_file: 'CMaps/test_FD001.txt'
 
+parameters:
+  healthy_threshold: 100
+  warning_threshold: 30
+  critical_threshold: 15
+  critical_RUL: 20
+
+anomaly_detection:
+  healthy_percentage: 0.80
+  contamination: 0.01
+
 features:
   window_size: 10
   correlation_threshold: 0.05
