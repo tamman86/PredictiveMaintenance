@@ -3,6 +3,7 @@ import numpy as np
 import yaml
 import joblib
 import matplotlib.pyplot as plt
+import utils
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import mean_squared_error
@@ -14,6 +15,7 @@ with open('config.yaml', 'r') as file:
 
 print(f"Target Dataset: {config['data']['train_file']}")
 print(f"Whitelisted Sensors: {config['features']['whitelist']}")
+window_size = config['features']['window_size']
 
 ### Load and Prep Data
 # Define columns
@@ -87,6 +89,7 @@ print(f"Defined as first {healthy_percentage*100}% of each engine's life.")
 iso_forest = IsolationForest(n_estimators = 100, contamination = config['anomaly_detection']['contamination'], random_state = 42)
 iso_forest.fit(X_train_healthy)
 
+'''
 ### Isolation Forest Test
 unit_no = 4
 unit_1 = df[df['unit_nr'] == unit_no].copy()
@@ -102,29 +105,16 @@ plt.axhline(0, color='red', linestyle='--', label='Threshold')
 plt.title("Effect of Smoothing on False Positives")
 plt.legend()
 plt.show()
-
+'''
 
 ############### Remaining Useful Life Logic ###############
 ### Implement Rolling Windows ###
-# Define window size
-window_size = config['features']['window_size']
-
-# Create rolling mean
-df_rolling = df.groupby('unit_nr')[sensors_to_use].rolling(window=window_size).mean()
-df_rolling.columns = [f"{col}_mean" for col in sensors_to_use]
-df_rolling = df_rolling.reset_index(level=0, drop=True)
-
-# Create rolling standard deviation
-df_std = df.groupby('unit_nr')[sensors_to_use].rolling(window=window_size).std()
-df_std.columns = [f"{col}_std" for col in sensors_to_use]
-df_std = df_std.reset_index(level=0, drop=True)
-
-df_processed = pd.concat([df, df_rolling, df_std], axis = 1).dropna()
+df_processed, features_final = utils.engineer_features(df, sensors_to_use, window_size = window_size)
+df_processed = df_processed.dropna()
 
 print(f"New Data Shape: {df_processed.shape}")
 
 ### Training the model ###
-features_final = sensors_to_use + list(df_rolling.columns) + list(df_std.columns)
 X = df_processed[features_final]
 y = df_processed['RUL']
 
@@ -147,8 +137,9 @@ print(f"Model RMSE: {rmse:.2f} cycles")   # On average, the prediciton is off by
 ### Save Products ###
 model_package = {
     'model': model,
-    'features': features_final,
+    'features_final': features_final,
     'sensor_list': sensors_to_use,
+    'window_size': window_size,
     'rmse': rmse,
     'config': config
 }

@@ -3,7 +3,7 @@
 # ------------------------------------------------------------------
 
 data:
-  train_file: 'CMaps/test_FD001.txt'
+  train_file: 'CMaps/test_FD001.txt'      # Location of Training File
 
 parameters:
   healthy_threshold: 100
@@ -12,18 +12,18 @@ parameters:
   critical_RUL: 20
 
 anomaly_detection:
-  healthy_percentage: 0.80
-  contamination: 0.01
+  healthy_percentage: 0.80      # Since this dataset is guaranteed to end at the exact moment of engine failure, we train the front 80% as normal
+  contamination: 0.01           # Assume 1% of the data fed is bad
 
 features:
-  window_size: 10
-  correlation_threshold: 0.05
-  whitelist:
+  window_size: 10   # Rolling Window Size
+  correlation_threshold: 0.05     # How strongly a sensor must correlate with RUL. 0.0 = Keep all and 1.0 = Keep only perfect
+  whitelist:        # Name all Sensors to protect from Feature Selection removal
     - "s_2"
     - "s_14"
     - "s_7"
 
-  sensor_names:
+  sensor_names:     # Name all Sensors here
     - "s_1"
     - "s_2"
     - "s_3"
@@ -47,9 +47,9 @@ features:
     - "s_21"
 
 training:
-  test_size: 0.2
-  random_state: 42
-  n_estimators: 100
+  test_size: 0.2          # Portion of data saved for testing the model
+  random_state: 42        # RNG seed
+  n_estimators: 100       # Number of Regression Tree "Voters"
 
 output:
   model_filename: "pdm_model_v1.pkl"
