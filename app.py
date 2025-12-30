@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
 
@@ -18,22 +18,19 @@ DB_CONFIG = {
     "port": "5432"
 }
 
-
 # --- DATABASE FUNCTIONS ---
 def get_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-
-def load_data(unit_id, limit=1000):
-    """Fetch the history for a specific engine ordered by TIME"""
+def load_data_by_date(unit_id, start_dt, end_dt):
     query = f"""
-    SELECT timestamp, time_cycles, rul_prediction, raw_data 
-    FROM sensor_predictions 
-    WHERE unit_nr = {unit_id}
-    ORDER BY timestamp ASC
-    """
-
-    # Fetch all and slice in Pandas to ensure we get the true "tail" of time
+        SELECT timestamp, time_cycles, rul_prediction, raw_data 
+        FROM sensor_predictions 
+        WHERE unit_nr = {unit_id}
+          AND timestamp >= '{start_dt}'
+          AND timestamp <= '{end_dt}'
+        ORDER BY timestamp ASC
+        """
     conn = get_connection()
     df = pd.read_sql(query, conn)
     conn.close()
@@ -55,6 +52,15 @@ def get_active_units():
     conn.close()
     return df['unit_nr'].tolist()
 
+def get_data_range():
+    conn = get_connection()
+    query = "SELECT MIN(timestamp), MAX(timestamp) FROM sensor_predictions"
+    df = pd.read_sql(query, conn)
+    conn.close()
+    if not df.empty and df.iloc[0,0] is not None:
+        return df.iloc[0,0], df.iloc[0,1]
+    return datetime.now(), datetime.now()
+
 # --- DASHBOARD LAYOUT ---
 st.set_page_config(page_title="Real-Time PDM", layout="wide")
 st.title("✈️ Predictive Maintenance Live Twin")
@@ -69,29 +75,66 @@ if not available_units:
     st.rerun()
 
 selected_unit = st.sidebar.selectbox("Select Engine Unit", available_units)
-history_depth = st.sidebar.slider("History Depth (Records)", min_value=50, max_value=2000, value=300)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Time Filter")
+
+# Filter Mode Selector
+filter_mode = st.sidebar.radio(
+    "Select Range Mode:",
+    ["Quick Slider (Days)", "Custom Lookback", "Specific Date Range"]
+)
+
+now = datetime.now()
+start_dt = now
+end_dt = now
+
+if filter_mode == "Quick Slider (Days)":
+    # Slider for 0 to 14 Days
+    days_back = st.sidebar.slider("Show Last X Days", min_value=1, max_value=14, value=1)
+    start_dt = now - timedelta(days=days_back)
+    end_dt = now
+
+elif filter_mode == "Custom Lookback":
+    # Custom Integer Input
+    days_back = st.sidebar.number_input("Enter Days to Look Back", min_value=1, value=30, step=1)
+    start_dt = now - timedelta(days=days_back)
+    end_dt = now
+
+elif filter_mode == "Specific Date Range":
+    # Specify Graph Window
+    # Check the Database for what information is available
+    min_db, max_db = get_data_range()
+
+    default_start = max_db - timedelta(days=7) if max_db else now - timedelta(days=7)
+
+    date_range = st.sidebar.date_input(
+        "Select Date Range",
+        value = (default_start, max_db),
+        max_value = datetime.now()
+    )
+
+    if len(date_range) == 2:
+        start_date, end_date = date_range
+        start_dt = datetime.combine(start_date, datetime.min.time())
+        end_dt = datetime.combine(end_date, datetime.max.time())
+    else:
+        st.sidebar.warning("Please select a Start and End date")
 
 # 2. Main Display
 @st.fragment(run_every=REFRESH_INTERVAL)
-def show_live_dashboard(unit_id, depth):
+def show_live_dashboard(unit_id, start, end):
 
     # Load Data
-    df = load_data(unit_id)
+    df = load_data_by_date(unit_id, start, end)
 
     if not df.empty:
-        # Slice to requested depth
-        df_view = df.tail(depth)
+        # Parse Sensors
+        df['Temp (s_11)'] = df['raw_data'].apply(lambda x: x.get('s_11', 0))
+        df['Pressure (s_12)'] = df['raw_data'].apply(lambda x: x.get('s_12', 0))
 
-        # --- PARSE RAW SENSORS ---
-        # Use s_11 and s_12 to visualize the physics
-        df_view = df_view.copy()
-        df_view['Temp (s_11)'] = df_view['raw_data'].apply(lambda x: x.get('s_11', 0))
-        df_view['Pressure (s_12)'] = df_view['raw_data'].apply(lambda x: x.get('s_12', 0))
-
-        latest_row = df_view.iloc[-1]
+        latest_row = df.iloc[-1]
         latest_rul = latest_row['rul_prediction']
-        latest_cycle = latest_row['time_cycles']
-
         latest_time = latest_row['timestamp'].strftime('%H:%M:%S')
 
         # 3-Stage Health Status
@@ -120,7 +163,7 @@ def show_live_dashboard(unit_id, depth):
 
         with c1:
             st.subheader("Predictive Maintenance Window")
-            fig_rul = px.line(df_view, x="timestamp", y="rul_prediction",
+            fig_rul = px.line(df, x="timestamp", y="rul_prediction",
                               title="Remaining Useful Life (Hours)",
                               labels={"rul_prediction": "Hours until Failure"})
 
@@ -137,16 +180,16 @@ def show_live_dashboard(unit_id, depth):
 
             # Temp on Left Y-Axis
             fig_sensors.add_trace(go.Scatter(
-                x=df_view['timestamp'],
-                y=df_view['Temp (s_11)'],
+                x=df['timestamp'],
+                y=df['Temp (s_11)'],
                 name="Temp (s_11)",
                 line=dict(color="#EF553B")
             ))
 
             # Pressure on Right Y-Axis
             fig_sensors.add_trace(go.Scatter(
-                x=df_view['timestamp'],
-                y=df_view['Pressure (s_12)'],
+                x=df['timestamp'],
+                y=df['Pressure (s_12)'],
                 name="Pressure (s_12)",
                 line=dict(color="#636EFA"),
                 yaxis="y2"
@@ -160,7 +203,9 @@ def show_live_dashboard(unit_id, depth):
             )
 
             st.plotly_chart(fig_sensors, width="content")
+    else:
+        st.info(f"No data found for Unit {unit_id} in the selected time range.")
 
 # 3. Main Execution
 if selected_unit:
-    show_live_dashboard(selected_unit, history_depth)
+    show_live_dashboard(selected_unit, start_dt, end_dt)
