@@ -1,90 +1,140 @@
+### consumer.py
+
 import sys
 import asyncio
 import json
 import pandas as pd
 import joblib
+import asyncpg
 from aiokafka import AIOKafkaConsumer
-import utils
 
+# Windows Fix
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Config
 KAFKA_BROKER = "localhost:9092"
 KAFKA_TOPIC = "sensor_readings"
-MODEL_FILE = "pdm_model_v1.pkl"
+MODEL_FILE = "pdm_model_v2.pkl"
 
-# State Memory (To remember last "n" cycles for each sensor"
-# Format: {unit_id: [reading_1, reading_2, ... reading_n] }
-sensor_buffers = {}
+DB_CONFIG = {
+    "user": "postgres",
+    "password": "password",
+    "database": "pdm_db",
+    "host": "localhost",
+    "port": "5432"
+}
+
 
 def flatten_readings(reading):
     flat_data = {
         'unit_nr': reading['unit_nr'],
         'time_cycles': reading['time_cycles']
     }
-
-    # Unpacking Sensors
     for i, val in enumerate(reading['sensors']):
-        flat_data[f's_{i+1}'] = val
-
+        flat_data[f's_{i + 1}'] = val
     for i, val in enumerate(reading['settings']):
-        flat_data[f'setting_{i+1}'] = val
-
+        flat_data[f'setting_{i + 1}'] = val
     return flat_data
 
-async def process_message(reading, model_package):
-    unit_id = reading['unit_nr']
 
-    model = model_package['model']
-    required_sensors = model_package['sensor_list']
-    window_size = model_package['window_size']
-
-    flat_reading = flatten_readings(reading)
-
-    # 1. Initialize buffer if new unit
-    if unit_id not in sensor_buffers:
-        sensor_buffers[unit_id] = []
-
-    # 2. Adding new reading to memory
-    sensor_buffers[unit_id].append(flat_reading)
-
-    # 3. Maintain window sized buffer
-    if len(sensor_buffers[unit_id]) > window_size:
-        sensor_buffers[unit_id].pop(0)
-
-    # 4. Verify we have a full window to make prediction
-    if len(sensor_buffers[unit_id]) == window_size:
-        df_window = pd.DataFrame(sensor_buffers[unit_id])
-
+async def init_db(pool):
+    create_table_query = '''
+    CREATE TABLE IF NOT EXISTS sensor_predictions (
+        timestamp TIMESTAMPTZ DEFAULT NOW(),
+        unit_nr INTEGER,
+        time_cycles INTEGER,
+        rul_prediction DOUBLE PRECISION,
+        raw_data JSONB
+    );
+    '''
+    create_hypertable_query = "SELECT create_hypertable('sensor_predictions', 'timestamp', if_not_exists => TRUE);"
+    async with pool.acquire() as conn:
+        await conn.execute(create_table_query)
         try:
-            # Engineer Features
-            df_engineered, final_cols = utils.engineer_features(df_window, required_sensors, window_size)
+            await conn.execute(create_hypertable_query)
+        except Exception:
+            pass
 
-            latest_row = df_engineered.iloc[[-1]][final_cols]
 
-            # Prediction
-            prediction = model.predict(latest_row)[0]
+async def save_to_db(pool, flat_reading, prediction):
+    query = """
+    INSERT INTO sensor_predictions (unit_nr, time_cycles, rul_prediction, raw_data)
+    VALUES ($1, $2, $3, $4)
+    """
+    raw_payload = flat_reading.copy()
+    del raw_payload['unit_nr']
+    del raw_payload['time_cycles']
+    json_payload = json.dumps(raw_payload)
 
-            print(f"🔮 Unit {unit_id} | Cycle {reading['time_cycles']} | RUL Prediction: {prediction:.2f}")
-        except Exception as e:
-            print(f"⚠️ Math Error on Unit {unit_id}: {e}")
+    async with pool.acquire() as conn:
+        await conn.execute(query, flat_reading['unit_nr'], flat_reading['time_cycles'], float(prediction), json_payload)
 
-    else:
-        # Not enough data yet (Need "window_size", have X)
-        print(f"⏳ Unit {unit_id} | Buffering... ({len(sensor_buffers[unit_id])}/{window_size})")
 
-async def consume():
-    # Load Model
-    print(f"Loading model from {MODEL_FILE}")
-    try:
-        model_package = joblib.load(MODEL_FILE)
-        print("Model Loaded")
-    except FileNotFoundError:
-        print("Model not found!")
+async def process_message(reading, model_artifact, pool):
+    # --- SAFETY CHECK: VALIDATE DATA ---
+    if not isinstance(reading, dict):
+        print(f"⚠️ SKIPPING BAD DATA (Not a Dict): {reading}")
         return
 
-    # Connect to Kafka
+    if 'unit_nr' not in reading:
+        print(f"⚠️ SKIPPING BAD DATA (Missing 'unit_nr'): {reading}")
+        return
+    # -----------------------------------
+
+    unit_id = reading['unit_nr']
+    flat_reading = flatten_readings(reading)
+
+    # UNPACK ARTIFACT
+    model = model_artifact['model']
+    required_features = model_artifact['features']
+
+    try:
+        # Dynamic Feature Extraction
+        input_data = {}
+        missing_sensors = []
+
+        for feature in required_features:
+            val = flat_reading.get(feature)
+            if val is not None:
+                input_data[feature] = val
+            else:
+                missing_sensors.append(feature)
+
+        if not missing_sensors:
+            # Predict
+            features_df = pd.DataFrame([input_data], columns=required_features)
+            prediction = model.predict(features_df)[0]
+
+            # Save
+            await save_to_db(pool, flat_reading, prediction)
+
+            if unit_id == 1 and flat_reading['time_cycles'] % 10 == 0:
+                print(f"💾 Unit {unit_id} | Cycle {flat_reading['time_cycles']} | RUL: {prediction:.2f}")
+        else:
+            print(f"⚠️ Unit {unit_id} missing features: {missing_sensors}")
+
+    except Exception as e:
+        print(f"⚠️ Calculation Error on Unit {unit_id}: {e}")
+
+
+async def consume():
+    print(f"Loading model artifact from {MODEL_FILE}")
+    try:
+        model_artifact = joblib.load(MODEL_FILE)
+        print(f"Model Loaded. Features: {model_artifact['features']}")
+    except Exception as e:
+        print(f"CRITICAL: Failed to load model. {e}")
+        return
+
+    print("Connecting to Database")
+    try:
+        pool = await asyncpg.create_pool(**DB_CONFIG)
+        await init_db(pool)
+    except Exception as e:
+        print(f"Database Connection Failed: {e}")
+        return
+
     consumer = AIOKafkaConsumer(
         KAFKA_TOPIC,
         bootstrap_servers=KAFKA_BROKER,
@@ -96,15 +146,16 @@ async def consume():
     print("Consumer Listening...")
 
     try:
-        # Main Loop
         async for msg in consumer:
             reading = msg.value
-            await process_message(reading, model_package)
+            await process_message(reading, model_artifact, pool)
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Consumer Error: {e}")
     finally:
         await consumer.stop()
+        await pool.close()
 
-if __name__ =='__main__':
+
+if __name__ == '__main__':
     asyncio.run(consume())
