@@ -9,7 +9,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # --- CONFIGURATION ---
-REFRESH_INTERVAL = 2.0  # Time between refreshing display
+REFRESH_INTERVAL = 1.0  # Time between refreshing display
 DB_CONFIG = {
     "dbname": "pdm_db",
     "user": "postgres",
@@ -22,13 +22,12 @@ DB_CONFIG = {
 def get_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-def load_data_by_date(unit_id, start_dt, end_dt):
+def load_data_since(unit_id, start_dt):
     query = f"""
         SELECT timestamp, time_cycles, rul_prediction, raw_data 
         FROM sensor_predictions 
         WHERE unit_nr = {unit_id}
           AND timestamp >= '{start_dt}'
-          AND timestamp <= '{end_dt}'
         ORDER BY timestamp ASC
         """
     conn = get_connection()
@@ -52,14 +51,27 @@ def get_active_units():
     conn.close()
     return df['unit_nr'].tolist()
 
-def get_data_range():
+def get_data_range_date(unit_id, start_dt, end_dt):
+    query = f"""
+        SELECT timestamp, time_cycles, rul_prediction, raw_data 
+        FROM sensor_predictions 
+        WHERE unit_nr = {unit_id}
+          AND timestamp >= '{start_dt}'
+          AND timestamp <= '{end_dt}'
+        ORDER BY timestamp ASC
+        """
     conn = get_connection()
-    query = "SELECT MIN(timestamp), MAX(timestamp) FROM sensor_predictions"
     df = pd.read_sql(query, conn)
     conn.close()
-    if not df.empty and df.iloc[0,0] is not None:
-        return df.iloc[0,0], df.iloc[0,1]
-    return datetime.now(), datetime.now()
+
+    if not df.empty:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        local_tz = datetime.now().astimezone().tzinfo
+        if df['timestamp'].dt.tz is None:
+            df['timestamp'] = df['timestamp'].dt.tz_localize('UTC')
+        df['timestamp'] = df['timestamp'].dt.tz_convert(local_tz)
+
+    return df
 
 # --- DASHBOARD LAYOUT ---
 st.set_page_config(page_title="Real-Time PDM", layout="wide")
@@ -77,56 +89,50 @@ if not available_units:
 selected_unit = st.sidebar.selectbox("Select Engine Unit", available_units)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Time Filter")
 
 # Filter Mode Selector
 filter_mode = st.sidebar.radio(
-    "Select Range Mode:",
-    ["Quick Slider (Days)", "Custom Lookback", "Specific Date Range"]
+    "View Mode:",
+    ["Live Monitor (Minutes)", "Deep Dive (Hours)", "Historical Analysis"]
 )
 
-now = datetime.now()
-start_dt = now
-end_dt = now
+fragment_args = {}
 
-if filter_mode == "Quick Slider (Days)":
-    # Slider for 0 to 14 Days
-    days_back = st.sidebar.slider("Show Last X Days", min_value=1, max_value=14, value=1)
-    start_dt = now - timedelta(days=days_back)
-    end_dt = now
+if filter_mode == "Live Monitor (Minutes)":
+    # Slider for Minutes
+    minutes = st.sidebar.slider("Show Last X Minutes", min_value=1, max_value=60, value=5)
+    fragment_args = {"mode": "live", "delta": timedelta(minutes=minutes)}
 
-elif filter_mode == "Custom Lookback":
-    # Custom Integer Input
-    days_back = st.sidebar.number_input("Enter Days to Look Back", min_value=1, value=30, step=1)
-    start_dt = now - timedelta(days=days_back)
-    end_dt = now
+elif filter_mode == "Deep Dive (Hours)":
+    # Slider for Hours
+    hours = st.sidebar.slider("Show Last X Hours", min_value=1, max_value=24, value=1)
+    fragment_args = {"mode": "live", "delta": timedelta(hours=hours)}
 
-elif filter_mode == "Specific Date Range":
-    # Specify Graph Window
-    # Check the Database for what information is available
-    min_db, max_db = get_data_range()
-
-    default_start = max_db - timedelta(days=7) if max_db else now - timedelta(days=7)
-
-    date_range = st.sidebar.date_input(
-        "Select Date Range",
-        value = (default_start, max_db),
-        max_value = datetime.now()
-    )
-
-    if len(date_range) == 2:
-        start_date, end_date = date_range
-        start_dt = datetime.combine(start_date, datetime.min.time())
-        end_dt = datetime.combine(end_date, datetime.max.time())
-    else:
-        st.sidebar.warning("Please select a Start and End date")
+elif filter_mode == "Historical Analysis":
+    # Date Picker for older data
+    d = st.sidebar.date_input("Select Date", datetime.now())
+    fragment_args = {"mode": "history", "date": d}
 
 # 2. Main Display
 @st.fragment(run_every=REFRESH_INTERVAL)
-def show_live_dashboard(unit_id, start, end):
+def show_live_dashboard(unit_id, args):
+    if not args:
+        return
 
-    # Load Data
-    df = load_data_by_date(unit_id, start, end)
+    now = datetime.now()
+    df = pd.DataFrame()
+
+    if args["mode"] == "live":
+        # LIVE MODE: Start = Now - Delta. No End Limit.
+        start_dt = now - args["delta"]
+        df = load_data_since(unit_id, start_dt)
+
+    elif args["mode"] == "history":
+        # HISTORICAL MODE: Specific 24h window
+        sel_date = args["date"]
+        start_dt = datetime.combine(sel_date, datetime.min.time())
+        end_dt = datetime.combine(sel_date, datetime.max.time())
+        df = get_data_range_date(unit_id, start_dt, end_dt)
 
     if not df.empty:
         # Parse Sensors
@@ -154,7 +160,7 @@ def show_live_dashboard(unit_id, start, end):
 
         # Color logic: Green if > 50, Red if < 50
         kpi2.metric("Est. Operating Hours Left", f"{latest_rul:.0f} Hours",
-                    delta_color="normal" if latest_rul > 50 else "inverse")
+                    delta_color="normal" if latest_rul > 72 else "inverse")
 
         kpi3.metric("Status", status_text)
 
@@ -170,7 +176,7 @@ def show_live_dashboard(unit_id, start, end):
             # Add Threshold Line
             fig_rul.add_hline(y=0, line_dash="solid", line_color="red")
             fig_rul.update_yaxes(range=[-10, 300])  # Range of RUL chart (Min/Max)
-            st.plotly_chart(fig_rul, width="content")
+            st.plotly_chart(fig_rul, use_container_width=True)
 
         with c2:
             st.subheader("Sensor Correlation (Temp vs Pressure)")
@@ -202,10 +208,10 @@ def show_live_dashboard(unit_id, start, end):
                 legend=dict(x=0, y=1.1, orientation="h")
             )
 
-            st.plotly_chart(fig_sensors, width="content")
+            st.plotly_chart(fig_sensors, use_container_width=True)
     else:
-        st.info(f"No data found for Unit {unit_id} in the selected time range.")
+        st.info("No data found in this window. Check the generator or select a different time.")
 
 # 3. Main Execution
-if selected_unit:
-    show_live_dashboard(selected_unit, start_dt, end_dt)
+if selected_unit and fragment_args:
+    show_live_dashboard(selected_unit, fragment_args)
