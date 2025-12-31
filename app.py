@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import plotly.express as px
 import plotly.graph_objects as go
 
@@ -23,11 +23,13 @@ def get_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 def load_data_since(unit_id, start_dt):
+    formatted_time = start_dt.strftime("%Y-%m-%d %H:%M:%Sz")
+
     query = f"""
         SELECT timestamp, time_cycles, rul_prediction, raw_data 
         FROM sensor_predictions 
         WHERE unit_nr = {unit_id}
-          AND timestamp >= '{start_dt}'
+          AND timestamp >= '{formatted_time}'
         ORDER BY timestamp ASC
         """
     conn = get_connection()
@@ -42,14 +44,6 @@ def load_data_since(unit_id, start_dt):
         df['timestamp'] = df['timestamp'].dt.tz_convert(local_tz)
 
     return df
-
-def get_active_units():
-    conn = get_connection()
-    # Query to get units that have reported recently
-    query = "SELECT DISTINCT unit_nr FROM sensor_predictions ORDER BY unit_nr"
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df['unit_nr'].tolist()
 
 def get_data_range_date(unit_id, start_dt, end_dt):
     query = f"""
@@ -73,6 +67,14 @@ def get_data_range_date(unit_id, start_dt, end_dt):
 
     return df
 
+def get_active_units():
+    conn = get_connection()
+    # Query to get units that have reported recently
+    query = "SELECT DISTINCT unit_nr FROM sensor_predictions ORDER BY unit_nr"
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df['unit_nr'].tolist()
+
 # --- DASHBOARD LAYOUT ---
 st.set_page_config(page_title="Real-Time PDM", layout="wide")
 st.title("✈️ Predictive Maintenance Live Twin")
@@ -87,7 +89,6 @@ if not available_units:
     st.rerun()
 
 selected_unit = st.sidebar.selectbox("Select Engine Unit", available_units)
-
 st.sidebar.markdown("---")
 
 # Filter Mode Selector
@@ -119,12 +120,12 @@ def show_live_dashboard(unit_id, args):
     if not args:
         return
 
-    now = datetime.now()
+    now_utc = datetime.now(timezone.utc)
     df = pd.DataFrame()
 
     if args["mode"] == "live":
         # LIVE MODE: Start = Now - Delta. No End Limit.
-        start_dt = now - args["delta"]
+        start_dt = now_utc - args["delta"]
         df = load_data_since(unit_id, start_dt)
 
     elif args["mode"] == "history":
